@@ -158,6 +158,21 @@ python swiftdeploy promote canary
 python swiftdeploy promote stable
 python swiftdeploy teardown --clean
 ```
+
+---
+
+## Screenshots (Google Drive)
+
+**Folder:** [Swift Deploy screenshots](https://drive.google.com/drive/folders/1SKQYKb_e_IFUSYO4WLsSKVNBB4KIilgH)
+
+The Drive folder includes:
+
+- **`validate`** output  
+- **`deploy`** output  
+- **`promote`** (canary / stable) and **`/healthz`** confirmation  
+- Generated **`nginx.conf`** and **`docker-compose.yml`**  
+- Nginx **access** logs  
+
 ---
 ## Notes
 
