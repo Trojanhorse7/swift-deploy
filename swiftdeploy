@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""swiftdeploy — manifest-driven Docker + Nginx orchestration CLI."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import socket
+import subprocess
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+import yaml
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+SCRIPT_PATH = Path(__file__).resolve()
+TEMPLATE_DIR = SCRIPT_PATH.parent / "templates"
+MANIFEST_NAME = "manifest.yaml"
+GENERATED = ("nginx.conf", "docker-compose.yml")
+API_SERVICE = "api"
+API_UID = 1000
+API_GID = 1000
+
+
+class CheckError(Exception):
+    """Raised when a validate check fails."""
+
+def find_repo_root(start: Path | None = None) -> Path:
+    cur = (start or Path.cwd()).resolve()
+    for _ in range(32):
+        if (cur / MANIFEST_NAME).is_file():
+            return cur
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    raise FileNotFoundError(
+        f"{MANIFEST_NAME} not found in {Path.cwd().resolve()} or any parent directory"
+    )
+
+
+def load_manifest(root: Path) -> dict:
+    path = root / MANIFEST_NAME
+    with path.open(encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+def validate_manifest_structure(data: dict) -> None:
+    try:
+        services = data["services"]
+        nginx = data["nginx"]
+        net = data["network"]
+        meta = data["metadata"]
+    except (KeyError, TypeError) as e:
+        raise CheckError(f"missing top-level section: {e}") from e
+
+    if not isinstance(meta, dict):
+        raise CheckError("metadata must be a mapping")
+
+    mode = services.get("mode")
+    checks = [
+        (services.get("image"), "services.image"),
+        (services.get("port"), "services.port"),
+        (mode, "services.mode"),
+        (nginx.get("image"), "nginx.image"),
+        (nginx.get("port"), "nginx.port"),
+        (nginx.get("proxy_timeout"), "nginx.proxy_timeout"),
+        (net.get("name"), "network.name"),
+        (net.get("driver_type"), "network.driver_type"),
+        (meta.get("version"), "metadata.version"),
+        (meta.get("contact"), "metadata.contact"),
+        (meta.get("deployed_by"), "metadata.deployed_by"),
+        (meta.get("service_name"), "metadata.service_name"),
+    ]
+    for val, label in checks:
+        if val is None or (isinstance(val, str) and not str(val).strip()):
+            raise CheckError(f"required field missing or empty: {label}")
+    if str(mode).lower() not in ("stable", "canary"):
+        raise CheckError("services.mode must be 'stable' or 'canary'")
+
+
+def _compose_app_version(data: dict) -> str:
+    meta = data.get("metadata") or {}
+    return str(data.get("app_version") or meta.get("version") or "0.0.0")
+
+
+def render_files(root: Path, data: dict) -> None:
+    env = Environment(
+        loader=FileSystemLoader(str(TEMPLATE_DIR)),
+        autoescape=select_autoescape(enabled_extensions=()),
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+
+    ctx = {
+        "services": data["services"],
+        "nginx": data["nginx"],
+        "network": data["network"],
+        "mode": data["services"]["mode"],
+        "app_version": _compose_app_version(data),
+        "metadata": data["metadata"],
+        "compose_project": data.get("compose_project", "swiftdeploy"),
+        "compose_api_service": API_SERVICE,
+        "api_uid": API_UID,
+        "api_gid": API_GID,
+    }
+
+    nginx_tpl = env.get_template("nginx.conf.j2")
+    compose_tpl = env.get_template("docker-compose.yml.j2")
+
+    (root / "nginx.conf").write_text(
+        nginx_tpl.render(**ctx) + "\n",
+        encoding="utf-8",
+    )
+    (root / "docker-compose.yml").write_text(
+        compose_tpl.render(**ctx) + "\n",
+        encoding="utf-8",
+    )
+
+
+def cmd_init(root: Path) -> None:
+    data = load_manifest(root)
+    validate_manifest_structure(data)
+    render_files(root, data)
+    print(f"[swiftdeploy] wrote {root / 'nginx.conf'}")
+    print(f"[swiftdeploy] wrote {root / 'docker-compose.yml'}")
+
+
+def _check_manifest_yaml(root: Path) -> dict:
+    path = root / MANIFEST_NAME
+    if not path.is_file():
+        raise CheckError(f"{MANIFEST_NAME} not found at {path}")
+    try:
+        with path.open(encoding="utf-8") as f:
+            return yaml.safe_load(f)
+    except yaml.YAMLError as e:
+        raise CheckError(f"invalid YAML: {e}") from e
+
+
+def _check_image_exists(image: str) -> None:
+    r = subprocess.run(
+        ["docker", "image", "inspect", image],
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        raise CheckError(
+            f"docker image not found locally: {image}\n"
+            f"Build it from the repo root, e.g.\n"
+            f"  docker build -t {image} ."
+        )
+
+
+def _check_port_free(port: int) -> None:
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", port))
+    except OSError as e:
+        raise CheckError(f"nginx port {port} is already in use on this host: {e}") from e
+    finally:
+        s.close()
+
+
+def _check_nginx_syntax(root: Path, data: dict) -> None:
+    env = Environment(
+        loader=FileSystemLoader(str(TEMPLATE_DIR)),
+        autoescape=select_autoescape(enabled_extensions=()),
+    )
+    ctx = {
+        "services": data["services"],
+        "nginx": data["nginx"],
+        "network": data["network"],
+        "mode": data["services"]["mode"],
+        "app_version": _compose_app_version(data),
+        "metadata": data["metadata"],
+        "compose_project": data.get("compose_project", "swiftdeploy"),
+        "compose_api_service": API_SERVICE,
+        "api_uid": API_UID,
+        "api_gid": API_GID,
+    }
+
+    text = env.get_template("nginx.conf.j2").render(**ctx)
+
+    nginx_image = data["nginx"]["image"]
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        suffix=".conf",
+        delete=False,
+        encoding="utf-8",
+    ) as tmp:
+        tmp.write(text + "\n")
+        tmp_path = tmp.name
+
+    try:
+        host_conf = Path(tmp_path).resolve()
+        mount = f"{host_conf.as_posix()}:/etc/nginx/nginx.conf:ro"
+        # Nginx resolves upstream hostnames at config-load time. The real Compose network
+        # is not attached here, so stub ``api`` (service name) to a dummy IP — ``nginx -t``
+        # only needs DNS to succeed, not a listening upstream.
+        r = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--add-host",
+                f"{API_SERVICE}:127.0.0.1",
+                "-v",
+                mount,
+                nginx_image,
+                "nginx",
+                "-t",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode != 0:
+            msg = (r.stderr or r.stdout or "").strip()
+            raise CheckError(f"nginx -t failed: {msg}")
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def cmd_validate(root: Path) -> int:
+    print("[swiftdeploy] validate — running pre-flight checks\n")
+
+    manifest_data: dict | None = None
+
+    def run_check(label: str, fn) -> bool:
+        try:
+            fn()
+            print(f"[PASS] {label}")
+            return True
+        except CheckError as e:
+            print(f"[FAIL] {label}")
+            print(f"       {e}")
+            return False
+
+    def load_yaml_check():
+        nonlocal manifest_data
+        manifest_data = _check_manifest_yaml(root)
+
+    if not run_check("manifest.yaml exists and is valid YAML", load_yaml_check):
+        return 1
+    assert manifest_data is not None
+
+    if not run_check(
+        "required manifest fields are present and non-empty",
+        lambda: validate_manifest_structure(manifest_data),
+    ):
+        return 1
+
+    ok_img = run_check(
+        "Docker image referenced in the manifest exists locally",
+        lambda: _check_image_exists(manifest_data["services"]["image"]),
+    )
+    ok_port = run_check(
+        "host port nginx.port (from manifest) is available for binding",
+        lambda: _check_port_free(int(manifest_data["nginx"]["port"])),
+    )
+    ok_ngx = run_check(
+        "rendered nginx.conf is syntactically valid (nginx -t)",
+        lambda: _check_nginx_syntax(root, manifest_data),
+    )
+
+    if not (ok_img and ok_port and ok_ngx):
+        return 1
+
+    print("\n[swiftdeploy] validate: all checks passed")
+    return 0
+
+
+def _compose_base(root: Path, data: dict) -> list[str]:
+    proj = data.get("compose_project", "swiftdeploy")
+    return [
+        "docker",
+        "compose",
+        "-f",
+        str(root / "docker-compose.yml"),
+        "-p",
+        proj,
+    ]
+
+
+def cmd_deploy(root: Path, timeout_s: float = 60.0) -> int:
+    cmd_init(root)
+    data = load_manifest(root)
+    compose_cmd = _compose_base(root, data)
+    print("[swiftdeploy] docker compose up --build -d")
+    r = subprocess.run(
+        compose_cmd + ["up", "--build", "-d"],
+        cwd=root,
+    )
+    if r.returncode != 0:
+        print("[swiftdeploy] deploy failed: compose up returned non-zero")
+        return r.returncode
+
+    nginx_port = int(data["nginx"]["port"])
+    url = f"http://127.0.0.1:{nginx_port}/healthz"
+    deadline = time.monotonic() + timeout_s
+    print(f"[swiftdeploy] waiting for healthy proxy at {url} (timeout {timeout_s}s)")
+    while time.monotonic() < deadline:
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                if resp.status == 200:
+                    body = resp.read().decode()
+                    print("[swiftdeploy] health check OK:")
+                    print(body)
+                    return 0
+        except (urllib.error.URLError, TimeoutError, ConnectionResetError):
+            pass
+        time.sleep(1.0)
+
+    print("[swiftdeploy] deploy timed out waiting for /healthz via nginx")
+    return 1
+
+
+def cmd_promote(root: Path, target: str) -> int:
+    target = target.lower()
+    if target not in ("canary", "stable"):
+        print("[swiftdeploy] promote requires: canary | stable")
+        return 2
+
+    path = root / MANIFEST_NAME
+    data = load_manifest(root)
+    validate_manifest_structure(data)
+
+    current = str(data["services"]["mode"]).lower()
+    if current == target:
+        print(f"[swiftdeploy] services.mode is already {target!r}")
+    else:
+        data["services"]["mode"] = target
+        with path.open("w", encoding="utf-8") as f:
+            yaml.safe_dump(
+                data,
+                f,
+                sort_keys=False,
+                default_flow_style=False,
+                allow_unicode=True,
+            )
+
+    cmd_init(root)
+    compose_cmd = _compose_base(root, load_manifest(root))
+
+    print(f"[swiftdeploy] restarting service '{API_SERVICE}' with MODE={target}")
+    r = subprocess.run(
+        compose_cmd
+        + [
+            "up",
+            "-d",
+            "--no-deps",
+            "--force-recreate",
+            API_SERVICE,
+        ],
+        cwd=root,
+    )
+    if r.returncode != 0:
+        return r.returncode
+
+    nginx_port = int(load_manifest(root)["nginx"]["port"])
+    url = f"http://127.0.0.1:{nginx_port}/healthz"
+    deadline = time.monotonic() + 45.0
+    mode_ok = False
+    last_body = ""
+    while time.monotonic() < deadline:
+        try:
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=2.0) as resp:
+                last_body = resp.read().decode()
+                payload = json.loads(last_body)
+                if payload.get("mode") == target:
+                    mode_ok = True
+                    break
+        except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError):
+            pass
+        time.sleep(0.5)
+
+    print("[swiftdeploy] GET /healthz response:")
+    print(last_body or "(empty)")
+    if not mode_ok:
+        print(f"[swiftdeploy] promote verification failed: expected mode={target!r} from /healthz")
+        return 1
+
+    print(f"[swiftdeploy] promote complete — active mode is {target!r}")
+    return 0
+
+
+def cmd_teardown(root: Path, clean: bool) -> int:
+    compose_yml = root / "docker-compose.yml"
+    if compose_yml.is_file():
+        try:
+            data = load_manifest(root)
+        except Exception:
+            data = {"compose_project": "swiftdeploy"}
+        compose_cmd = _compose_base(root, data)
+        print("[swiftdeploy] docker compose down -v --remove-orphans")
+        subprocess.run(
+            compose_cmd + ["down", "-v", "--remove-orphans"],
+            cwd=root,
+        )
+    else:
+        print("[swiftdeploy] no docker-compose.yml — skipping compose down")
+
+    if clean:
+        for name in GENERATED:
+            p = root / name
+            if p.is_file():
+                p.unlink()
+                print(f"[swiftdeploy] removed {p}")
+
+    print("[swiftdeploy] teardown finished")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="swiftdeploy")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("init", help="Render nginx.conf + docker-compose.yml from manifest.yaml")
+
+    sub.add_parser("validate", help="Run five pre-flight checks")
+
+    p_deploy = sub.add_parser("deploy", help="init + compose up + wait for /healthz via nginx")
+    p_deploy.add_argument(
+        "--timeout",
+        type=float,
+        default=60.0,
+        help="seconds to wait for health via nginx (default: 60)",
+    )
+
+    p_promote = sub.add_parser(
+        "promote",
+        help="Set services.mode in manifest.yaml, regenerate, recreate api only, verify /healthz",
+    )
+    p_promote.add_argument("mode", choices=("canary", "stable"))
+
+    p_teardown = sub.add_parser("teardown", help="compose down -v; optional --clean removes generated files")
+    p_teardown.add_argument(
+        "--clean",
+        action="store_true",
+        help=f"delete {' + '.join(GENERATED)} from repo root",
+    )
+
+    args = parser.parse_args(argv)
+    root = find_repo_root()
+
+    if args.command == "init":
+        cmd_init(root)
+        return 0
+    if args.command == "validate":
+        return cmd_validate(root)
+    if args.command == "deploy":
+        return cmd_deploy(root, timeout_s=args.timeout)
+    if args.command == "promote":
+        return cmd_promote(root, args.mode)
+    if args.command == "teardown":
+        return cmd_teardown(root, args.clean)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

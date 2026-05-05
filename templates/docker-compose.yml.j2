@@ -1,0 +1,59 @@
+name: {{ compose_project }}
+
+services:
+  api:
+    image: {{ services.image }}
+    restart: unless-stopped
+    environment:
+      MODE: "{{ services.mode }}"
+      APP_VERSION: "{{ app_version }}"
+      APP_PORT: "{{ services.port }}"
+      METADATA_VERSION: "{{ metadata.version }}"
+      METADATA_SERVICE_NAME: "{{ metadata.service_name }}"
+      METADATA_CONTACT: "{{ metadata.contact }}"
+      METADATA_DEPLOYED_BY: "{{ metadata.deployed_by }}"
+    # No host ports: traffic enters only via Nginx
+    expose:
+      - "{{ services.port }}"
+    networks:
+      - swiftdeploy_net
+    volumes:
+      - api_logs:/var/log/swiftdeploy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    user: "{{ api_uid }}:{{ api_gid }}"
+    healthcheck:
+      test:
+        ["CMD", "curl", "-f", "http://localhost:{{ services.port }}/healthz"]
+      interval: 10s
+      timeout: 2s
+      retries: 3
+      start_period: 15s
+
+  nginx:
+    image: {{ nginx.image }}
+    restart: unless-stopped
+    ports:
+      - "{{ nginx.port }}:{{ nginx.port }}"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - swiftdeploy_net
+    depends_on:
+      api:
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    user: nginx
+
+networks:
+  swiftdeploy_net:
+    name: {{ network.name }}
+    driver: {{ network.driver_type }}
+
+volumes:
+  api_logs:
