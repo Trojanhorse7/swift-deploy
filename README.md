@@ -75,6 +75,7 @@ Thresholds are **only** defined here (see [`policies/infrastructure/policy.rego`
 | Block | Purpose |
 |-------|---------|
 | **`thresholds.min_disk_free_gb`** | Pre-deploy gate: host disk headroom |
+| **`thresholds.min_mem_available_gb`** | Pre-deploy gate: host RAM available (**`/proc`-style** via psutil `available`) |
 | **`thresholds.max_cpu_load`** | Pre-deploy gate: 1-minute load (Unix) or CPU-derived estimate (Windows) |
 | **`thresholds.max_error_rate_percent`** | Pre-promote to **canary**: rolling-window error rate from Prometheus gauges |
 | **`thresholds.max_p99_latency_ms`** | Pre-promote to **canary**: rolling-window P99 latency |
@@ -114,6 +115,7 @@ compose_project: swiftdeploy
 policy:
   thresholds:
     min_disk_free_gb: 10
+    min_mem_available_gb: 1
     max_cpu_load: 2.0
     max_error_rate_percent: 1
     max_p99_latency_ms: 500
@@ -157,11 +159,11 @@ Runs **`init`**, starts the **`opa`** service (**`docker compose up -d opa`**) a
 
 ### `status [--interval SEC] [-n N]`
 
-Live dashboard: **`/healthz`**, **`/metrics`** (approximate **req/s** from counter deltas, window **err%** / **P99**), and live OPA evaluations (**infrastructure** gate + hypothetical **promote→canary**). Each sample is appended as one JSON line to **`history.jsonl`** (gitignored).
+Live dashboard: **`/healthz`**, **`/metrics`** (approximate **req/s** from counter deltas, window **err%** / **P99**), **`chaos_active`** from metrics when present, **per-rule policy compliance** from OPA **`decision.checks`**, plus aggregate ALLOW/DENY. Each sample is appended as one JSON line to **`history.jsonl`** (gitignored).
 
 ### `audit`
 
-Reads **`history.jsonl`** and writes **`audit_report.md`** (GFM summary, violation table, recent timeline).
+Reads **`history.jsonl`** and writes **`audit_report.md`** (GFM summary, **timeline events** for mode/chaos transitions, violation table, recent samples including chaos).
 
 ### `teardown [--clean]`
 

@@ -19,6 +19,7 @@ compose_project: swiftdeploy
 policy:
   thresholds:
     min_disk_free_gb: 10
+    min_mem_available_gb: 1
     max_cpu_load: 2.0
     max_error_rate_percent: 1
     max_p99_latency_ms: 500

@@ -107,6 +107,7 @@ def validate_policy_section(data: dict) -> None:
 
     for key in (
         "min_disk_free_gb",
+        "min_mem_available_gb",
         "max_cpu_load",
         "max_error_rate_percent",
         "max_p99_latency_ms",
@@ -342,6 +343,7 @@ def thresholds_payload(data: dict) -> dict:
     t = data["policy"]["thresholds"]
     return {
         "min_disk_free_gb": float(t["min_disk_free_gb"]),
+        "min_mem_available_gb": float(t["min_mem_available_gb"]),
         "max_cpu_load": float(t["max_cpu_load"]),
         "max_error_rate_percent": float(t["max_error_rate_percent"]),
         "max_p99_latency_ms": float(t["max_p99_latency_ms"]),
@@ -355,6 +357,8 @@ def collect_host_stats() -> tuple[dict | None, str | None]:
     try:
         du = psutil.disk_usage(os.path.abspath(os.sep))
         free_gb = du.free / (1024**3)
+        vm = psutil.virtual_memory()
+        mem_avail_gb = vm.available / (1024**3)
         try:
             load1 = float(os.getloadavg()[0])
         except (AttributeError, OSError):
@@ -367,6 +371,7 @@ def collect_host_stats() -> tuple[dict | None, str | None]:
         return {
             "disk_free_gb": round(free_gb, 4),
             "cpu_load_1m": round(load1, 4),
+            "mem_available_gb": round(mem_avail_gb, 4),
         }, None
     except OSError as e:
         return None, f"host stats error: {e}"
@@ -510,6 +515,17 @@ def gauge_value(metrics_text: str, name: str) -> float | None:
     return None
 
 
+def chaos_semantic(val: object) -> str:
+    """Human-readable chaos_active gauge (0 none, 1 slow, 2 error)."""
+    if val is None:
+        return "unknown"
+    try:
+        i = int(round(float(val)))
+    except (TypeError, ValueError):
+        return str(val)
+    return {0: "none", 1: "slow", 2: "error"}.get(i, f"code_{i}")
+
+
 def sum_counter(metrics_text: str, name: str) -> float:
     total = 0.0
     for fam in text_string_to_metric_families(metrics_text):
@@ -562,25 +578,50 @@ def opa_snapshot(out: OpaOutcome) -> dict[str, object]:
     if not out.ok:
         return {"ok": False, "error": out.failure_message or "unknown"}
     dec = out.decision or {}
-    return {
+    snap: dict[str, object] = {
         "ok": True,
         "allowed": bool(dec.get("allowed")),
         "reasons": dec.get("reasons"),
         "domain": dec.get("domain"),
     }
+    if isinstance(dec.get("checks"), list):
+        snap["checks"] = dec["checks"]
+    return snap
+
+
+def print_policy_checks(title: str, out: OpaOutcome) -> None:
+    """Print per-rule compliance from OPA decision.checks (never decides locally)."""
+    print(f"  Policy compliance ({title}):")
+    if not out.ok:
+        print(f"    (no rules evaluated - {out.failure_message})")
+        return
+    dec = out.decision or {}
+    checks = dec.get("checks")
+    if not isinstance(checks, list) or not checks:
+        status = "ALLOW" if dec.get("allowed") else "DENY"
+        print(f"    (aggregate only: {status})")
+        return
+    for row in checks:
+        if not isinstance(row, dict):
+            continue
+        rid = row.get("rule_id", "?")
+        passed = row.get("passed")
+        detail = row.get("detail", "")
+        tag = "PASS" if passed else "FAIL"
+        print(f"    [{tag}] {rid}: {detail}")
 
 
 def print_opa_status(label: str, out: OpaOutcome) -> None:
+    print_policy_checks(label, out)
     if not out.ok:
-        print(f"  OPA [{label}]: TRANSPORT ERROR - {out.failure_message}")
+        print(f"  OPA [{label}] aggregate: TRANSPORT ERROR")
         return
     dec = out.decision or {}
-    if dec.get("allowed"):
-        print(f"  OPA [{label}]: ALLOW")
-        return
-    print(f"  OPA [{label}]: DENY")
-    for line in dec.get("reasons") or []:
-        print(f"    - {line}")
+    agg = "ALLOW" if dec.get("allowed") else "DENY"
+    print(f"  OPA [{label}] aggregate: {agg}")
+    if not dec.get("allowed"):
+        for line in dec.get("reasons") or []:
+            print(f"    - {line}")
 
 
 def append_history(root: Path, record: dict) -> None:
@@ -594,7 +635,7 @@ def cmd_deploy(root: Path, timeout_s: float = 60.0) -> int:
     data = load_manifest(root)
     compose_cmd = _compose_base(root, data)
 
-    print("[swiftdeploy] starting OPA (policy engine) …")
+    print("[swiftdeploy] starting OPA (policy engine) ...")
     r = subprocess.run(compose_cmd + ["up", "-d", "opa"], cwd=root)
     if r.returncode != 0:
         print("[swiftdeploy] failed to start OPA container")
@@ -606,6 +647,7 @@ def cmd_deploy(root: Path, timeout_s: float = 60.0) -> int:
         return 1
 
     infra = run_pre_deploy_policy(data)
+    print_policy_checks("infrastructure (pre-deploy)", infra)
     if not infra.ok:
         print(f"[swiftdeploy] pre-deploy policy: transport error - {infra.failure_message}")
         return 1
@@ -667,6 +709,7 @@ def cmd_promote(root: Path, target: str) -> int:
     else:
         pr = run_pre_promote_canary_policy(data, "", "stable")
 
+    print_policy_checks("canary (pre-promote)", pr)
     if not pr.ok:
         print(f"[swiftdeploy] pre-promote policy: transport error - {pr.failure_message}")
         return 1
@@ -760,6 +803,7 @@ def cmd_status(root: Path, interval_s: float = 3.0, iterations: int | None = Non
 
             rps_val: float | None = None
             wm: dict[str, float | int] = {}
+            chaos_active: int | None = None
             if mtext is not None:
                 now_m = time.monotonic()
                 total = sum_counter(mtext, "http_requests_total")
@@ -770,6 +814,9 @@ def cmd_status(root: Path, interval_s: float = 3.0, iterations: int | None = Non
                 prev_total = total
                 prev_mono = now_m
                 wm = window_metrics_from_prometheus(mtext, data)
+                cv = gauge_value(mtext, "chaos_active")
+                if cv is not None:
+                    chaos_active = int(round(cv))
 
             infra = run_pre_deploy_policy(data)
             canary_pre = (
@@ -792,6 +839,7 @@ def cmd_status(root: Path, interval_s: float = 3.0, iterations: int | None = Non
                     "healthz_error": herr,
                     "metrics_error": merr,
                     "req_per_s": rps_val,
+                    "chaos_active": chaos_active,
                     "window": wm,
                     "opa_infrastructure": opa_snapshot(infra),
                     "opa_canary_promote": opa_snapshot(canary_pre),
@@ -811,6 +859,13 @@ def cmd_status(root: Path, interval_s: float = 3.0, iterations: int | None = Non
                     f"err_rate={wm['error_rate_percent']}% "
                     f"p99={wm['p99_latency_ms']}ms"
                 )
+            if chaos_active is not None:
+                leg = chaos_semantic(chaos_active)
+                print(f"  chaos_active: {chaos_active} ({leg})")
+            elif mtext is None:
+                print("  chaos_active: (n/a - no metrics)")
+            else:
+                print("  chaos_active: (n/a)")
             print_opa_status("infrastructure (pre-deploy)", infra)
             print_opa_status("canary (hypothetical promote->canary)", canary_pre)
 
@@ -861,6 +916,36 @@ def cmd_audit(root: Path) -> int:
             elif snap.get("allowed") is False:
                 violations.append({"time": ts, "domain": label, "reasons": snap.get("reasons")})
 
+    timeline_events: list[dict[str, object]] = []
+    prev_mode: object | None = None
+    prev_chaos: object | None = None
+    for rec in records:
+        iso = rec.get("iso") if rec.get("iso") is not None else rec.get("ts")
+        mode = rec.get("mode")
+        chaos = rec.get("chaos_active") if "chaos_active" in rec else None
+
+        if prev_mode is not None and mode is not None and mode != prev_mode:
+            timeline_events.append(
+                {
+                    "time": iso,
+                    "kind": "mode_change",
+                    "detail": f"{prev_mode} -> {mode}",
+                }
+            )
+        if mode is not None:
+            prev_mode = mode
+
+        if prev_chaos is not None and chaos is not None and chaos != prev_chaos:
+            timeline_events.append(
+                {
+                    "time": iso,
+                    "kind": "chaos_change",
+                    "detail": f"{chaos_semantic(prev_chaos)} -> {chaos_semantic(chaos)}",
+                }
+            )
+        if chaos is not None:
+            prev_chaos = chaos
+
     gen_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     lines_out = [
         "# SwiftDeploy audit report",
@@ -873,9 +958,31 @@ def cmd_audit(root: Path) -> int:
         f"- Policy denials (`allowed: false`): **{len(violations)}**",
         f"- OPA transport / parser errors: **{len(errors)}**",
         "",
-        "## Violations",
+        "## Timeline events",
         "",
     ]
+
+    if timeline_events:
+        lines_out.extend(
+            [
+                "| Time (UTC) | Event | Detail |",
+                "|------------|-------|--------|",
+            ]
+        )
+        for ev in timeline_events:
+            kind = str(ev.get("kind", "")).replace("|", "\\|")
+            det = str(ev.get("detail", "")).replace("|", "\\|")
+            lines_out.append(f"| {ev.get('time')} | {kind} | {det} |")
+        lines_out.append("")
+    else:
+        lines_out.extend(["_No mode or chaos transitions detected in the sampled history._", ""])
+
+    lines_out.extend(
+        [
+        "## Violations",
+        "",
+        ]
+    )
 
     if violations:
         lines_out.extend(
@@ -918,8 +1025,8 @@ def cmd_audit(root: Path) -> int:
     tail = records[-25:]
     lines_out.extend(
         [
-            "| Time | Mode | req/s | err% | P99 ms | infra | canary↑ |",
-            "|------|------|-------|------|--------|-------|---------|",
+            "| Time | Mode | Chaos | req/s | err% | P99 ms | infra | canary↑ |",
+            "|------|------|-------|-------|------|--------|-------|---------|",
         ]
     )
     for rec in tail:
@@ -932,8 +1039,13 @@ def cmd_audit(root: Path) -> int:
         p99 = wm.get("p99_latency_ms", "-")
         opi = rec.get("opa_infrastructure")
         opc = rec.get("opa_canary_promote")
+        cv = rec.get("chaos_active")
+        if cv is None:
+            chaos_cell = "-"
+        else:
+            chaos_cell = f"{cv} ({chaos_semantic(cv)})".replace("|", "\\|")
         lines_out.append(
-            f"| {rec.get('iso')} | {rec.get('mode')} | {rps_s} | {errp} | {p99} | "
+            f"| {rec.get('iso')} | {rec.get('mode')} | {chaos_cell} | {rps_s} | {errp} | {p99} | "
             f"{snap_cell(opi)} | {snap_cell(opc)} |"
         )
     lines_out.append("")
