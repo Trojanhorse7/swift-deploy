@@ -5,3 +5,5 @@ __pycache__/
 venv/
 nginx.conf
 docker-compose.yml
+history.jsonl
+audit_report.md

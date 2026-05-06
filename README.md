@@ -18,7 +18,7 @@ chmod +x swiftdeploy   # Unix/macOS; on Windows use `python swiftdeploy`
 
 ---
 
-## `manifest.yaml` (explicit structure)
+## `manifest.yaml`
 
 ### `services` (API workload)
 
@@ -68,7 +68,23 @@ Optional: top-level **`app_version`** overrides the Compose **`APP_VERSION`** en
 
 - **`compose_project`** — Docker Compose project name (`docker compose -p`)
 
-Example (see repo file for the live copy):
+### `policy` (OPA + Prometheus thresholds)
+
+Thresholds are **only** defined here (see [`policies/infrastructure/policy.rego`](policies/infrastructure/policy.rego) and [`policies/canary/policy.rego`](policies/canary/policy.rego)); Rego compares **`input.thresholds`** / **`input.host`** / **`input.metrics`**.
+
+| Block | Purpose |
+|-------|---------|
+| **`thresholds.min_disk_free_gb`** | Pre-deploy gate: host disk headroom |
+| **`thresholds.max_cpu_load`** | Pre-deploy gate: 1-minute load (Unix) or CPU-derived estimate (Windows) |
+| **`thresholds.max_error_rate_percent`** | Pre-promote to **canary**: rolling-window error rate from Prometheus gauges |
+| **`thresholds.max_p99_latency_ms`** | Pre-promote to **canary**: rolling-window P99 latency |
+| **`thresholds.metrics_window_seconds`** | Must match API **`METRICS_WINDOW_SECONDS`** (Compose passes this env) |
+| **`opa.image`** | Sidecar image for `opa run --server /policies` |
+| **`opa.host_port`** | Published as **`127.0.0.1:<port>:8181`** only (local policy queries) |
+
+OPA listens on **`http://127.0.0.1:<policy.opa.host_port>`** (maps container **8181**). Prometheus text format for the app is exposed at **`GET http://127.0.0.1:<nginx.port>/metrics`** (proxied through Nginx to the API).
+
+Example (see repo [`manifest.yaml`](manifest.yaml) for the live copy):
 
 ```yaml
 services:
@@ -85,12 +101,29 @@ network:
   name: swiftdeploy-net
   driver_type: bridge
 
+app_version: "1.0.0"
+
 metadata:
   version: "1.0.0"
   service_name: swiftdeploy-api
   contact: "felixgogodae777@gmail.com"
   deployed_by: "swiftdeploy"
+
+compose_project: swiftdeploy
+
+policy:
+  thresholds:
+    min_disk_free_gb: 10
+    max_cpu_load: 2.0
+    max_error_rate_percent: 1
+    max_p99_latency_ms: 500
+    metrics_window_seconds: 30
+  opa:
+    image: openpolicyagent/opa:0.69.0
+    host_port: 9182
 ```
+
+Blog write-up:
 
 ---
 
@@ -103,7 +136,7 @@ Parses YAML → writes **`./nginx.conf`** + **`./docker-compose.yml`** from [`te
 ### `validate` (all five must PASS)
 
 1. **`manifest.yaml` exists** and parses as YAML (**PyYAML**)  
-2. **Required fields** non-empty (includes **`services.mode`**, **`nginx.proxy_timeout`**, full **`metadata`** block)  
+2. **Required fields** non-empty (includes **`services.mode`**, **`nginx.proxy_timeout`**, full **`metadata`** block, and **`policy.thresholds`** / **`policy.opa`**)  
 3. **`docker image inspect <services.image>`** succeeds  
 4. **`nginx.port`** from manifest is **free** on the host (`socket.bind` probe)  
 5. Rendered config passes **`nginx -t`** inside a throwaway `docker run` using **`<nginx.image>`**, config mounted at **`/etc/nginx/nginx.conf`**, and **`--add-host=api:127.0.0.1`** so the static **`upstream api:…`** resolves during the check (real Compose DNS is used at runtime).
@@ -112,14 +145,23 @@ Any failure → **non-zero exit**.
 
 ### `deploy`
 
-Runs **`init`**, then **`docker compose up --build -d`**, then blocks up to **60s** on **`GET http://127.0.0.1:<nginx.port>/healthz`** through Nginx.
+Runs **`init`**, starts the **`opa`** service (**`docker compose up -d opa`**) and waits for OPA health, runs **pre-deploy** policy against **`swiftdeploy/infrastructure/decision`** (host disk + load vs **`manifest.policy.thresholds`**). On **DENY**, prints reasons and exits **without** bringing up the rest of the stack. On **ALLOW**, runs **`docker compose up --build -d`**, then blocks up to **60s** on **`GET http://127.0.0.1:<nginx.port>/healthz`** through Nginx.
 
 ### `promote canary|stable` (exact sequence)
 
-1. **Rewrite `manifest.yaml`** — sets **`services.mode`** to the target  
-2. **`init`** — regenerate root configs  
-3. **`docker compose up -d --no-deps --force-recreate api`** — **only** the API container restarts  
-4. **Verify** — polls **`GET /healthz`** via Nginx until JSON **`mode`** matches the promotion target (or timeout → failure)
+1. **Pre-promote policy** — **`swiftdeploy/canary/decision`**. Promoting **to stable** skips SLO checks (policy allows). Promoting **to canary** scrapes **`/metrics`**, derives rolling-window error rate + P99 from **`swiftdeploy_window_*`** gauges, and compares to thresholds; **DENY** exits before **`manifest.yaml`** is modified.  
+2. **Rewrite `manifest.yaml`** — sets **`services.mode`** to the target (skipped if already set)  
+3. **`init`** — regenerate root configs  
+4. **`docker compose up -d --no-deps --force-recreate api`** — **only** the API container restarts  
+5. **Verify** — polls **`GET /healthz`** via Nginx until JSON **`mode`** matches the promotion target (or timeout → failure)
+
+### `status [--interval SEC] [-n N]`
+
+Live dashboard: **`/healthz`**, **`/metrics`** (approximate **req/s** from counter deltas, window **err%** / **P99**), and live OPA evaluations (**infrastructure** gate + hypothetical **promote→canary**). Each sample is appended as one JSON line to **`history.jsonl`** (gitignored).
+
+### `audit`
+
+Reads **`history.jsonl`** and writes **`audit_report.md`** (GFM summary, violation table, recent timeline).
 
 ### `teardown [--clean]`
 
@@ -129,11 +171,12 @@ Runs **`init`**, then **`docker compose up --build -d`**, then blocks up to **60
 
 ## Docker Compose constraints (generated)
 
-The **`api`** service template intentionally has **no `ports:`** mapping — only **`expose`**. Published ports exist **only** on **`nginx`**.
+The **`api`** service template intentionally has **no `ports:`** mapping — only **`expose`**. The host-facing HTTP port is published on **`nginx`**; **`opa`** binds **`127.0.0.1:<policy.opa.host_port>`** only (localhost policy queries).
 
 Other items baked into the template:
 
-- **`restart: unless-stopped`** on both services  
+- **`opa`** service — **`opa run --server /policies`** with repo **`./policies`** mounted read-only; port **`127.0.0.1:<policy.opa.host_port>:8181`**  
+- **`restart: unless-stopped`** on **`api`**, **`nginx`**, and **`opa`**  
 - **`healthcheck`** on **`api`**: `curl -f http://localhost:<services.port>/healthz` with **`interval: 10s`**, **`timeout: 2s`**, **`retries: 3`**  
 - **`cap_drop: [ALL]`**, **`security_opt: no-new-privileges:true`**, **`user: "1000:1000"`** on **`api`**  
 - Named volume **`api_logs`** mounted at **`/var/log/swiftdeploy`** on **`api`**
@@ -144,6 +187,7 @@ Other items baked into the template:
 
 - **`GET /`** — includes **`mode`**, **`version`**, manifest-driven **`metadata`** map, timestamps  
 - **`GET /healthz`** — **`status`**, **`uptime_seconds`**, **`mode`** (used by **`promote`** verification)  
+- **`GET /metrics`** — Prometheus exposition format (**`http_requests_total`**, **`http_request_duration_seconds`**, rolling-window **`swiftdeploy_window_*`** gauges for canary policy inputs)  
 - **`POST /chaos`** — **canary only** (`403` in stable). Chaos state is **process-global** (`ChaosState`). **`POST /chaos` is excluded from slow/error chaos** so it stays responsive for **`recover`**.
 
 ---
@@ -154,6 +198,8 @@ Other items baked into the template:
 docker build -t swiftdeploy-hng14-api:latest .
 python swiftdeploy validate
 python swiftdeploy deploy
+python swiftdeploy status --interval 2 -n 5   # optional: five samples then exit
+python swiftdeploy audit                      # writes ./audit_report.md
 python swiftdeploy promote canary
 python swiftdeploy promote stable
 python swiftdeploy teardown --clean
@@ -177,6 +223,7 @@ The Drive folder includes:
 ## Notes
 
 - **`swiftdeploy promote`** rewrites **`manifest.yaml`** with **`yaml.safe_dump`** — **YAML comments and key order may change**; values stay correct.
+- **`history.jsonl`** and **`audit_report.md`** are gitignored local artifacts from **`status`** / **`audit`**.
 
 ---
 

@@ -1,33 +1,28 @@
-# SwiftDeploy — single source of truth (edit only this file for deployment shape).
-# Generated files (nginx.conf, docker-compose.yml) live in the repo root.
-# The comments would be removed after the deployment is successful
-
-# Services section
 services:
   image: swiftdeploy-hng14-api:latest
   port: 3000
-  mode: stable # REQUIRED: stable | canary (swiftdeploy promote updates this in-place)
-
-# Nginx section
+  mode: stable
 nginx:
   image: nginx:1.27-alpine
   port: 8080
-  proxy_timeout: 60s # drives proxy_connect/send/read_timeout in generated nginx.conf
-
-# Network section
+  proxy_timeout: 60s
 network:
   name: swiftdeploy-net
   driver_type: bridge
-
-# App version section
-app_version: "1.0.0"
-
-# Metadata section
+app_version: 1.0.0
 metadata:
-  version: "1.0.0"
+  version: 1.0.0
   service_name: swiftdeploy-api
-  contact: "felixgogodae777@gmail.com"
-  deployed_by: "swiftdeploy"
-
-# Compose project section
+  contact: felixgogodae777@gmail.com
+  deployed_by: swiftdeploy
 compose_project: swiftdeploy
+policy:
+  thresholds:
+    min_disk_free_gb: 10
+    max_cpu_load: 2.0
+    max_error_rate_percent: 1
+    max_p99_latency_ms: 500
+    metrics_window_seconds: 30
+  opa:
+    image: openpolicyagent/opa:0.69.0
+    host_port: 9182

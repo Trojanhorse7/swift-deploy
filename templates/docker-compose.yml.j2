@@ -12,6 +12,7 @@ services:
       METADATA_SERVICE_NAME: "{{ metadata.service_name }}"
       METADATA_CONTACT: "{{ metadata.contact }}"
       METADATA_DEPLOYED_BY: "{{ metadata.deployed_by }}"
+      METRICS_WINDOW_SECONDS: "{{ policy.thresholds.metrics_window_seconds }}"
     # No host ports: traffic enters only via Nginx
     expose:
       - "{{ services.port }}"
@@ -49,6 +50,17 @@ services:
     cap_drop:
       - ALL
     user: nginx
+
+  opa:
+    image: {{ policy.opa.image }}
+    restart: unless-stopped
+    command: ["run", "--server", "/policies"]
+    volumes:
+      - ./policies:/policies:ro
+    ports:
+      - "127.0.0.1:{{ policy.opa.host_port }}:8181"
+    networks:
+      - swiftdeploy_net
 
 networks:
   swiftdeploy_net:
