@@ -1,7 +1,7 @@
 services:
   image: swiftdeploy-hng14-api:latest
   port: 3000
-  mode: stable
+  mode: canary
 nginx:
   image: nginx:1.27-alpine
   port: 8080
