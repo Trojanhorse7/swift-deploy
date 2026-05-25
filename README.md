@@ -26,7 +26,7 @@ chmod +x swiftdeploy   # Unix/macOS; on Windows use `python swiftdeploy`
 |-------|---------|
 | **`image`** | Local Docker image name/tag for the API (**must** match `docker build -t …`) |
 | **`port`** | **Internal** container listen port — **not** published on the host |
-| **`mode`** | **`stable`** or **`canary`** — **required**; `swiftdeploy promote` updates **`services.mode` in-place** and regenerates Compose |
+| **`mode`** | **`stable`** or **`canary`** — **required**; `swiftdeploy promote` updates **`services.mode` in-place** and regenerates Compose. The committed [`manifest.yaml`](manifest.yaml) reflects the last promote target. |
 
 ### `nginx` (reverse proxy)
 
