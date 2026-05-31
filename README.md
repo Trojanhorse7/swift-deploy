@@ -38,7 +38,7 @@ chmod +x swiftdeploy   # Unix/macOS; on Windows use `python swiftdeploy`
 
 Generated Nginx also includes:
 
-- **`add_header X-Deployed-By "`**`metadata.deployed_by`**`"`** on every response  
+- **`add_header X-Deployed-By "`**`metadata.deployed_by`**`"`** on every response
 - **`proxy_pass_header X-Mode`** so clients see upstream canary header  
 - **`error_page` `502`/`503`/`504`** returning JSON bodies **`{ error, code, service, contact }`** using **`metadata.service_name`** and **`metadata.contact`**  
 - Access log format: **`$time_iso8601 | $status | ${request_time}s | $upstream_addr | $request`** (written to **stdout** so `docker compose logs nginx` works under **`user: nginx`**)
