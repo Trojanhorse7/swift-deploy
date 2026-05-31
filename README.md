@@ -151,7 +151,7 @@ Runs **`init`**, starts the **`opa`** service (**`docker compose up -d opa`**) a
 
 ### `promote canary|stable` (exact sequence)
 
-1. **Pre-promote policy** — **`swiftdeploy/canary/decision`**. Promoting **to stable** skips SLO checks (policy allows). Promoting **to canary** scrapes **`/metrics`**, derives rolling-window error rate + P99 from **`swiftdeploy_window_*`** gauges, and compares to thresholds; **DENY** exits before **`manifest.yaml`** is modified.  
+1. **Pre-promote policy** — **`swiftdeploy/canary/decision`**. Promoting **to stable** skips SLO checks (policy allows). Promoting **to canary** scrapes **`/metrics`**, derives rolling-window error rate + P99 from **`swiftdeploy_window_*`** gauges, and compares against thresholds; **DENY** exits before **`manifest.yaml`** is modified.  
 2. **Rewrite `manifest.yaml`** — sets **`services.mode`** to the target (skipped if already set)  
 3. **`init`** — regenerate root configs  
 4. **`docker compose up -d --no-deps --force-recreate api`** — **only** the API container restarts  
